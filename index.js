@@ -4,6 +4,8 @@ const rateLimit = require("express-rate-limit");
 const helmet = require("helmet");
 const SellingPartnerAPI = require("amazon-sp-api");
 const path = require("path");
+const cloudinary = require("cloudinary").v2;
+const multer = require("multer");
 
 const app = express();
 app.use(express.json());
@@ -12,7 +14,7 @@ require("dotenv").config();
 const cors = require("cors");
 const allowedOrigins = [
   "https://studykey-gifts.vercel.app",
-  // "http://localhost:3000",
+  "http://localhost:3000",
 ];
 
 const nodemailer = require("nodemailer");
@@ -59,7 +61,8 @@ const OrderSchema = new Schema({
   language: String,
   email: { type: String, required: true },
   orderId: { type: String, unique: true },
-  createdAt: { type: Date, default: Date.now }, // Add createdAt field
+  createdAt: { type: Date, default: Date.now },
+  reviewImage: String,
 });
 
 let Order;
@@ -121,7 +124,7 @@ app.use(
 );
 
 let sellingPartner = new SellingPartnerAPI({
-  region: "na", // The region of the selling partner API endpoint (“eu”, “na” or “fe”)
+  region: "na", // The region of the selling partner API endpoint ("eu", "na" or "fe")
   refresh_token: process.env.REFRESH_TOKEN, // The refresh token of your app user
   options: {
     credentials: {
@@ -168,28 +171,62 @@ app.post("/validate-order-id", async (req, res) => {
   }
 });
 
-app.post("/submit-review", async (req, res) => {
+// Configure multer for image uploads only
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 5 * 1024 * 1024, // 5MB limit for images
+  },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith('image/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only image files are allowed!'), false);
+    }
+  }
+});
+
+// Configure Cloudinary
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
+
+// Helper function to upload image to Cloudinary
+async function uploadToCloudinary(file) {
+  const b64 = Buffer.from(file.buffer).toString('base64');
+  const dataURI = `data:${file.mimetype};base64,${b64}`;
+  
+  return await cloudinary.uploader.upload(dataURI, {
+    folder: 'review-images',
+    resource_type: 'image',
+    public_id: `review-${Date.now()}`
+  });
+}
+
+app.post("/submit-review", upload.single("image"), async (req, res) => {
   const formData = req.body;
 
   if (formData) {
     try {
       await connectToDatabase();
-      const order = new Order(formData);
+
+      // Handle image upload if present
+      let imageUrl = null;
+      if (req.file) {
+        const result = await uploadToCloudinary(req.file);
+        imageUrl = result.secure_url;
+      }
+
+      const order = new Order({
+        ...formData,
+        reviewImage: imageUrl,
+      });
+
       await order.save();
 
-      // Email to the user
-      let userMailOptions = {
-        from: process.env.GMAIL_USER, // Sender address
-        to: formData.email, // User's email
-        subject: "Study Key FREE gift", // Subject line
-        template: "reward", // Name of the template file without extension
-        context: {
-          // Variables to replace in the template
-          name: formData.name,
-        },
-      };
-
-      // Email to the admin
+      // Update admin email to include image
       let adminMailOptions = {
         from: process.env.GMAIL_USER,
         to: process.env.GMAIL_USER,
@@ -199,37 +236,9 @@ app.post("/submit-review", async (req, res) => {
           ${Object.entries(formData)
             .map(([key, value]) => `<p><strong>${key}:</strong> ${value}</p>`)
             .join("")}
+          ${imageUrl ? `<p><strong>Review Image:</strong> <a href="${imageUrl}">View Image</a></p>` : ""}
         `),
       };
-      
-
-      // // Send email to the user
-      // transporter.sendMail(userMailOptions, (error, info) => {
-      //   if (error) {
-      //     console.error(error);
-      //   } else {
-      //     // Send email to the admin
-      //     transporter.sendMail(adminMailOptions, (error, info) => {
-      //       if (error) {
-      //         console.error(error);
-      //       } else {
-      //         console.log(info);
-      //       }
-      //     });
-      //   }
-      // });
-
-      await new Promise((resolve, reject) => {
-        transporter.sendMail(userMailOptions, (error, info) => {
-          if (error) {
-            console.error("Error sending email to user:", error);
-            reject(error);
-          } else {
-            console.log("Email sent to user:", info);
-            resolve(info);
-          }
-        });
-      });
 
       await new Promise((resolve, reject) => {
         transporter.sendMail(adminMailOptions, (error, info) => {
@@ -243,11 +252,13 @@ app.post("/submit-review", async (req, res) => {
         });
       });
 
-      res
-        .status(200)
-        .json({ success: true, message: "Emails sent successfully" });
+      res.status(200).json({
+        success: true,
+        message: "Submission successful",
+        imageUrl: imageUrl,
+      });
     } catch (err) {
-      console.log(err);
+      console.error('Upload error:', err);
       if (err.code === 11000 && err.keyPattern && err.keyPattern.orderId) {
         return res.status(409).json({
           success: false,
@@ -255,9 +266,12 @@ app.post("/submit-review", async (req, res) => {
           errorCode: "DUPLICATE_CLAIM",
         });
       }
-      res
-        .status(500)
-        .json({ success: false, message: "Error: " + err.message });
+      res.status(500).json({ 
+        success: false, 
+        message: err.message.includes('file size') 
+          ? "File size too large. Please upload a smaller file."
+          : "Error: " + err.message 
+      });
     }
   } else {
     res.status(400).json({ success: false, message: "Invalid form data" });
@@ -274,9 +288,9 @@ app.get("/api/location", async (req, res) => {
   res.send(geo);
 });
 
-// app.listen(5000, function (err) {
-//   if (err) console.log("Error in server setup");
-//   console.log("Server listening on Port", 5000);
-// });
+app.listen(5000, function (err) {
+  if (err) console.log("Error in server setup");
+  console.log("Server listening on Port", 5000);
+});
 
 module.exports = app;
